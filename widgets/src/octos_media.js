@@ -42,6 +42,14 @@ body.o-pip .o-pipov{display:block;position:absolute;inset:0;z-index:10;backgroun
 .o-pipov .cls{position:absolute;top:5px;right:5px;width:30px;height:30px;border:0;border-radius:50%;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center}
 .o-pipov .tog svg{width:24px;height:24px;fill:#fff}
 .o-pipov .cls svg{width:18px;height:18px;fill:#fff}
+/* PiP control bar — surfaced OUTSIDE the video rect. The in-video .o-pipov
+   controls are occluded by the YouTube video's hardware surface (see
+   docs/WEBVIEW-VIDEO-BLACK-HANDOFF.md) and clipped by the PiP overflow:hidden,
+   so restore/close were invisible. This bar sits just above the PiP. */
+#o-pipbar{position:fixed;right:10px;bottom:218px;z-index:58;width:150px;height:34px;display:none;align-items:center;justify-content:space-around;background:rgba(15,15,15,.94);border:1px solid #333;border-radius:17px;box-shadow:0 4px 14px rgba(0,0,0,.6)}
+body.o-pip #o-pipbar{display:flex}
+#o-pipbar .o-pb{width:36px;height:34px;border:0;background:transparent;display:flex;align-items:center;justify-content:center;padding:0;cursor:pointer}
+#o-pipbar .o-pb svg{width:20px;height:20px;fill:#fff}
 /* meta + actions */
 .o-title{font-size:16px;font-weight:600;line-height:1.35;margin:11px 12px 3px}
 .o-meta{font-size:12.5px;color:#aaa;margin:0 12px 9px}
@@ -157,11 +165,29 @@ body.o-pip .o-pipov{display:block;position:absolute;inset:0;z-index:10;backgroun
     } else { ["captions","cc"].forEach(function(m){ try{P.yt.setOption(m,"track",{});}catch(e){} try{P.yt.unloadModule(m);}catch(e){} }); } }catch(e){} };
   P.captions = function (o) { if(o.on!==undefined)P.cc=o.on; if(o.lang!==undefined){P.ccLang=o.lang; P.cc=!!o.lang;} if(o.size!==undefined)P.capFont=o.size; P._caps(); };
   P.LANGS = [["","Off (original)"],["en","English"],["es","Espanol / Spanish"],["zh-Hans","Chinese (Simplified)"],["zh-Hant","Chinese (Traditional)"],["hi","Hindi"],["ar","Arabic"],["fr","French"],["ja","Japanese"],["de","German"],["pt","Portuguese"],["ru","Russian"],["ko","Korean"],["it","Italian"],["tr","Turkish"],["vi","Vietnamese"],["th","Thai"],["id","Indonesian"],["nl","Dutch"],["pl","Polish"],["uk","Ukrainian"],["el","Greek"],["iw","Hebrew"],["sv","Swedish"],["fil","Filipino"],["ms","Malay"],["bn","Bengali"],["ta","Tamil"],["ur","Urdu"],["fa","Persian"],["ro","Romanian"],["cs","Czech"]];
-  P.mini = function (on) { P._mini = on; document.body.classList.toggle("o-pip", on); };
+  P.mini = function (on) { P._mini = on; document.body.classList.toggle("o-pip", on); P._ensurePipBar(); };
+  /* The in-video PiP controls (.o-pipov) are occluded by the video's hardware
+     surface + clipped by the PiP overflow:hidden, so they never show. Surface a
+     control bar OUTSIDE the video rect (body-level) that delegates to the same
+     (occluded but still functional) handlers. Created once; CSS shows it while
+     body.o-pip is set. */
+  P._ensurePipBar = function () {
+    if (document.getElementById("o-pipbar")) return;
+    var bar = document.createElement("div"); bar.id = "o-pipbar";
+    bar.innerHTML =
+        '<button class="o-pb r" aria-label="Restore">'+O_ic("fs")+'</button>'
+      + '<button class="o-pb t" aria-label="Play/Pause">'+O_ic("pause")+'</button>'
+      + '<button class="o-pb c" aria-label="Close">'+O_ic("close")+'</button>';
+    document.body.appendChild(bar);
+    bar.querySelector(".o-pb.r").onclick = function(){ var o=document.querySelector(".o-pipov"); if(o)o.click(); };    // onMax (restore)
+    bar.querySelector(".o-pb.t").onclick = function(){ P.toggle(); };                                                  // play/pause
+    bar.querySelector(".o-pb.c").onclick = function(){ var c=document.querySelector(".o-pipov .cls"); if(c)c.click(); }; // onClose
+  };
   P.fs = function () { var f = document.querySelector(".o-player iframe"); if (f && f.requestFullscreen) f.requestFullscreen(); };
   P.gestures = function (onMin) { P._onMin = onMin; P._setupGest(); };
   P._setupGest = function () {
     var pl = document.querySelector(".o-player"); if (!pl) return;
+    P._ensurePipBar();                            // visible PiP controls, whichever way PiP is entered
     if (pl.querySelector(".o-gest")) return;                       // once
     var g = document.createElement("div"); g.className = "o-gest";
     pl.insertBefore(g, pl.firstChild);                            // FIRST child: the IFrame API never touches it

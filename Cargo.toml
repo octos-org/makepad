@@ -9,8 +9,9 @@ workspace.members = [
     "examples/splash",
     "examples/splash_card",
     "examples/splash_catalog",
-    "examples/splash_runtime",
-    "examples/material_catalog",
+    // TEMP(ci): member dir absent at this pin — excluded so cargo can parse the workspace
+    // "examples/splash_runtime",
+    // "examples/material_catalog",
     "examples/slides",
     "examples/isolate",
     "examples/uizoo",

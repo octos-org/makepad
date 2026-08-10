@@ -2657,6 +2657,17 @@ fn collection_at(name: &str, index: usize) -> Option<String> {
 /// stored list — and a second copy of this match is how they would drift into
 /// answering the same question two different ways.
 fn yahoo_chart_field(bytes: &[u8], field: &str) -> String {
+    // Did Yahoo actually answer with a chart? A refusal still arrives as a
+    // complete HTTP response with a JSON body, so the fetch layer hands it over
+    // as success and every field below falls back to an em dash — which the host
+    // reads as "still fetching" (`state_of_answer` in the app's l0_card.rs), not
+    // as a failure. Measured on the 6T: Yahoo answered `429 Too Many Requests`
+    // and the card sat on "Fetching the quote…" indefinitely, which is the one
+    // thing §5.9's two states exist to keep apart. `n/a` is the failed sentinel,
+    // so the card renders its own `.failed` copy instead.
+    if json_pluck(bytes, "chart.result.0.meta.symbol").is_none() {
+        return "n/a".into();
+    }
     let m = |k: &str| format!("chart.result.0.meta.{k}");
                 let num = |k: &str| json_pluck(&bytes, &m(k)).and_then(|s| s.parse::<f64>().ok());
                 // Monetary fields formatted to a consistent 2 decimals (Yahoo

@@ -43,7 +43,12 @@ fn slippy_mosaic(lat: f64, lon: f64, z: u32) -> (i64, i64, f64, f64) {
     let left = if xf.fract() >= 0.5 { xf.floor() } else { xf.floor() - 1.0 };
     let top = if yf.fract() >= 0.5 { yf.floor() } else { yf.floor() - 1.0 };
     let max = (1i64 << z) - 1;
-    let left = (left as i64).clamp(0, (max - 1).max(0));
+    // Longitude WRAPS at the antimeridian: keep `left` raw (it may be -1 so
+    // the anchor stays in the mosaic's middle band — a Fiji-class epicenter
+    // used to get clamped and land at the pane's edge) and wrap the actual
+    // tile x with rem_euclid when forming URLs. Latitude cannot wrap, so `top`
+    // stays clamped.
+    let left = left as i64;
     let top = (top as i64).clamp(0, (max - 1).max(0));
     ((left), (top), (xf - left as f64) / 2.0, (yf - top as f64) / 2.0)
 }
@@ -179,14 +184,23 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
     vm.add_method(
         sys,
         id_lut!(satellite),
-        script_args_def!(lat = NIL, lon = NIL),
+        script_args_def!(lat = NIL, lon = NIL, zoom = NIL),
         |vm, args| {
             let lat = script_value!(vm, args.lat).as_number().unwrap_or(35.68);
             let lon = script_value!(vm, args.lon).as_number().unwrap_or(139.65);
-            // Keep the 7°-tall box inside the poles; wrap longitude edges.
+            // Optional slippy-style zoom (default 8 = the historical 14°-wide
+            // frame; each +1 halves the span): z10 ≈ a metro close-up, z6 ≈ a
+            // continental view. Omitting the arg keeps old cards identical.
+            let z = script_value!(vm, args.zoom)
+                .as_number()
+                .unwrap_or(8.0)
+                .clamp(3.0, 12.0);
+            let half_lon = 7.0 * f64::powi(2.0, 8 - z as i32);
+            let half_lat = half_lon / 2.0;
+            // Keep the box inside the poles; wrap longitude edges.
             let lat = lat.clamp(-78.0, 78.0);
-            let (min_lon, max_lon) = ((lon - 7.0).max(-180.0), (lon + 7.0).min(180.0));
-            let (min_lat, max_lat) = (lat - 3.5, lat + 3.5);
+            let (min_lon, max_lon) = ((lon - half_lon).max(-180.0), (lon + half_lon).min(180.0));
+            let (min_lat, max_lat) = (lat - half_lat, lat + half_lat);
             let date = gibs_latest_date();
             let url = format!(
                 "https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&LAYERS=MODIS_Terra_CorrectedReflectance_TrueColor&SRS=EPSG:4326&BBOX={min_lon},{min_lat},{max_lon},{max_lat}&WIDTH=880&HEIGHT=440&FORMAT=image/jpeg&TIME={date}"
@@ -243,13 +257,20 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
     vm.add_method(
         sys,
         id_lut!(basemap),
-        script_args_def!(lat = NIL, lon = NIL),
+        script_args_def!(lat = NIL, lon = NIL, zoom = NIL),
         |vm, args| {
             let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
             let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
-            let (x, y) = slippy_tile(lat, lon, 8);
+            // Optional zoom (default 8 = the historical metro framing; omitting
+            // the arg keeps old cards identical). Zoom by intent: region 6,
+            // metro 8, city 10, district 12.
+            let z = script_value!(vm, args.zoom)
+                .as_number()
+                .unwrap_or(8.0)
+                .clamp(3.0, 17.0) as u32;
+            let (x, y) = slippy_tile(lat, lon, z);
             let url = format!(
-                "https://a.basemaps.cartocdn.com/rastertiles/voyager_labels_under/8/{x}/{y}@2x.png"
+                "https://a.basemaps.cartocdn.com/rastertiles/voyager_labels_under/{z}/{x}/{y}@2x.png"
             );
             vm.bx.heap.new_string_from_str(&url)
         },
@@ -264,12 +285,18 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
     vm.add_method(
         sys,
         id_lut!(airmap),
-        script_args_def!(lat = NIL, lon = NIL),
+        script_args_def!(lat = NIL, lon = NIL, zoom = NIL),
         |vm, args| {
             let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
             let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
-            let (x, y) = slippy_tile(lat, lon, 8);
-            let url = format!("https://tiles.waqi.info/tiles/usepa-aqi/8/{x}/{y}.png?token=_");
+            // Optional zoom (default 8 keeps old cards identical). MUST match
+            // the zoom of the sys.basemap it stacks over, tile for tile.
+            let z = script_value!(vm, args.zoom)
+                .as_number()
+                .unwrap_or(8.0)
+                .clamp(3.0, 17.0) as u32;
+            let (x, y) = slippy_tile(lat, lon, z);
+            let url = format!("https://tiles.waqi.info/tiles/usepa-aqi/{z}/{x}/{y}.png?token=_");
             vm.bx.heap.new_string_from_str(&url)
         },
     );
@@ -308,9 +335,11 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
                 "br" => (1, 1, "d"),
                 _ => (0, 0, "a"), // "tl" and anything unrecognized
             };
+            // Wrap tile x across the antimeridian (left may be -1 or n-1+1).
+            let n = 1i64 << z;
             let url = format!(
                 "https://{sub}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{}/{}@2x.png",
-                left + dx,
+                (left + dx).rem_euclid(n),
                 top + dy
             );
             vm.bx.heap.new_string_from_str(&url)
@@ -644,6 +673,201 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let secs = crate::splash::sim_clock_secs();
             let v = if period > 0.0 { secs % period } else { secs };
             ScriptValue::from_f64(v)
+        },
+    );
+
+    // sys.citytime(lat, lon, "field") -> the CURRENT wall-clock time AT A PLACE,
+    // as a string. The DST-correct UTC offset comes from ONE cached open-meteo
+    // fetch per lat/lon (`timezone=auto`); the time itself is the device clock
+    // plus that offset, so a `fn tick()` card re-reading it every second costs
+    // nothing after the first fetch.
+    //   "hm"   -> "14:05"      "hms"     -> "14:05:09"
+    //   "h12"  -> "2:05 PM"    "day"     -> "Mon"     "day_zh"  -> "周一"
+    //   "date" -> "Aug 4"      "date_zh" -> "8月4日"
+    //   "offset" -> "UTC+9" / "UTC+5:30" / "UTC-7"    "tz" -> "Asia/Tokyo"
+    // Returns "—" while the offset fetch loads; the next tick fills it in.
+    vm.add_method(
+        sys,
+        id_lut!(citytime),
+        script_args_def!(lat = NIL, lon = NIL, field = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let field_value = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_value, &mut field);
+            let url = tz_offset_url(lat, lon);
+            let value = match vm.host.cx_mut().script_data_fetch(&url) {
+                Some(bytes) => match field.trim() {
+                    "tz" => json_pluck(&bytes, "timezone").unwrap_or_else(|| "—".to_string()),
+                    "abbr" => json_pluck(&bytes, "timezone_abbreviation")
+                        .unwrap_or_else(|| "—".to_string()),
+                    f => match tz_offset_secs(&bytes) {
+                        Some(off) => format_city_time(now_unix_secs() as i64 + off, off, f),
+                        None => "—".to_string(),
+                    },
+                },
+                None => vm.host.cx_mut().script_data_placeholder(&url),
+            };
+            vm.bx.heap.new_string_from_str(&value)
+        },
+    );
+
+    // sys.citytimenum(lat, lon, "field") -> the same place-local clock as a
+    // NUMBER for script conditions (day/night row theming, analog hands):
+    //   "hour" 0-23   "hour12" 1-12   "minute"   "second"   "offsecs"
+    // -9999 while the offset fetch loads.
+    vm.add_method(
+        sys,
+        id_lut!(citytimenum),
+        script_args_def!(lat = NIL, lon = NIL, field = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let field_value = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_value, &mut field);
+            let url = tz_offset_url(lat, lon);
+            let n = vm
+                .host
+                .cx_mut()
+                .script_data_fetch(&url)
+                .and_then(|bytes| tz_offset_secs(&bytes))
+                .map(|off| {
+                    let local = now_unix_secs() as i64 + off;
+                    let (h, m, s) = hms_from_secs(local);
+                    match field.trim() {
+                        "hour" => h as f64,
+                        "hour12" => {
+                            let x = h % 12;
+                            if x == 0 { 12.0 } else { x as f64 }
+                        }
+                        "minute" => m as f64,
+                        "second" => s as f64,
+                        "offsecs" => off as f64,
+                        _ => -9999.0,
+                    }
+                })
+                .unwrap_or(-9999.0);
+            ScriptValue::from_f64(n)
+        },
+    );
+
+    // sys.fx("FROM", "TO") -> the LIVE exchange rate as a display string
+    // ("0.8669", "156.68") — ExchangeRate-API open endpoint, keyless.
+    // ONE cached fetch per FROM currency covers every TO. "—" while loading.
+    // For MATH use sys.fxnum; never write a literal rate into a card.
+    vm.add_method(
+        sys,
+        id_lut!(fx),
+        script_args_def!(from = NIL, to = NIL),
+        |vm, args| {
+            let from_value = script_value!(vm, args.from);
+            let mut from = String::new();
+            vm.bx.heap.cast_to_string(from_value, &mut from);
+            let from = from.trim().to_ascii_uppercase();
+            let to_value = script_value!(vm, args.to);
+            let mut to = String::new();
+            vm.bx.heap.cast_to_string(to_value, &mut to);
+            let to = to.trim().to_ascii_uppercase();
+            let value = if from == to {
+                "1".to_string()
+            } else {
+                let url = fx_url(&from, &to);
+                match vm.host.cx_mut().script_data_fetch(&url) {
+                    Some(bytes) => json_pluck(&bytes, FX_RATE_PATH)
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .map(format_fx_rate)
+                        .unwrap_or_else(|| "—".to_string()),
+                    None => vm.host.cx_mut().script_data_placeholder(&url),
+                }
+            };
+            vm.bx.heap.new_string_from_str(&value)
+        },
+    );
+
+    // sys.fxnum("FROM", "TO") -> the raw rate as a NUMBER for math:
+    //   app.amt * sys.fxnum("USD", "EUR")
+    // -9999 while loading — gate on `>= 0` before showing a converted amount.
+    vm.add_method(
+        sys,
+        id_lut!(fxnum),
+        script_args_def!(from = NIL, to = NIL),
+        |vm, args| {
+            let from_value = script_value!(vm, args.from);
+            let mut from = String::new();
+            vm.bx.heap.cast_to_string(from_value, &mut from);
+            let from = from.trim().to_ascii_uppercase();
+            let to_value = script_value!(vm, args.to);
+            let mut to = String::new();
+            vm.bx.heap.cast_to_string(to_value, &mut to);
+            let to = to.trim().to_ascii_uppercase();
+            let n = if from == to {
+                1.0
+            } else {
+                let url = fx_url(&from, &to);
+                vm.host
+                    .cx_mut()
+                    .script_data_fetch(&url)
+                    .and_then(|bytes| json_pluck(&bytes, FX_RATE_PATH))
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(-9999.0)
+            };
+            ScriptValue::from_f64(n)
+        },
+    );
+
+    // sys.fmtdur(secs) -> a duration/clock string: "04:35" under an hour,
+    // "1:04:35" from an hour up. Negative clamps to "00:00". Pure math — the
+    // timer/stopwatch formatter (the script engine has no floor or %).
+    vm.add_method(
+        sys,
+        id_lut!(fmtdur),
+        script_args_def!(secs = NIL),
+        |vm, args| {
+            let n = script_value!(vm, args.secs).as_number().unwrap_or(0.0);
+            let t = if n.is_finite() && n > 0.0 { n.round() as i64 } else { 0 };
+            let (h, m, s) = (t / 3600, (t / 60) % 60, t % 60);
+            let out = if h > 0 {
+                format!("{h}:{m:02}:{s:02}")
+            } else {
+                format!("{m:02}:{s:02}")
+            };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
+    // sys.fmtnum(x, maxdecimals) -> x as a display string with AT MOST that many
+    // decimals, trailing zeros trimmed: sys.fmtnum(42.0, 6) -> "42",
+    // sys.fmtnum(0.866934, 4) -> "0.8669". THE display formatter for calculator
+    // results and converted amounts — the script engine cannot round.
+    vm.add_method(
+        sys,
+        id_lut!(fmtnum),
+        script_args_def!(x = NIL, decimals = NIL),
+        |vm, args| {
+            let x = script_value!(vm, args.x).as_number().unwrap_or(0.0);
+            let d = script_value!(vm, args.decimals)
+                .as_number()
+                .unwrap_or(2.0)
+                .clamp(0.0, 9.0) as usize;
+            let mut out = if x.is_finite() {
+                format!("{x:.d$}")
+            } else {
+                "—".to_string()
+            };
+            if out.contains('.') {
+                while out.ends_with('0') {
+                    out.pop();
+                }
+                if out.ends_with('.') {
+                    out.pop();
+                }
+            }
+            if out == "-0" {
+                out = "0".to_string();
+            }
+            vm.bx.heap.new_string_from_str(&out)
         },
     );
 
@@ -1364,6 +1588,58 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
+    // sys.quakes(index, "field") -> a REAL recent earthquake from the USGS
+    // live feed (M2.5+, last 24 h, keyless), newest first: index 0 = the most
+    // recent event. THE LLM MUST CALL THIS FOR EVERY DISPLAYED VALUE — an
+    // invented magnitude/place destroys trust in the whole card. Fields
+    // (case-insensitive):
+    //   place -> "42 km SW of Ashkasham, Afghanistan"
+    //   mag   -> "4.6"        (one decimal)
+    //   depth -> "10 km"      (whole km)
+    //   time  -> "2h ago"     (humanized age; "now" under a minute)
+    //   lat|lon -> "36.5622"  (4 decimals — chain into sys.basemap)
+    //   count -> total events in the feed (ignores `index`)
+    // Returns "—" while the (async) fetch loads or the index is out of range;
+    // the card re-evaluates when data lands (same redraw semantics as
+    // sys.weather). ONE URL-deduped fetch serves all rows × fields of a card.
+    vm.add_method(
+        sys,
+        id_lut!(quakes),
+        script_args_def!(index = NIL, field = NIL),
+        |vm, args| {
+            let idx = script_value!(vm, args.index).as_number().unwrap_or(0.0).max(0.0) as i64;
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let out = match vm.host.cx_mut().script_data_fetch(QUAKES_FEED_URL) {
+                Some(bytes) => quake_field(&bytes, idx, field.trim()),
+                None => "—".to_string(),
+            };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
+    // sys.quakesnum(index, "field") -> the same quake values as NUMBERS
+    // (mag, depth, lat, lon, count) so scripts can branch on magnitude or
+    // chain the epicenter into sys.basemap(lat, lon). Returns -9999 while the
+    // fetch loads; guard with >= -9998 (same convention as sys.weathernum).
+    vm.add_method(
+        sys,
+        id_lut!(quakesnum),
+        script_args_def!(index = NIL, field = NIL),
+        |vm, args| {
+            let idx = script_value!(vm, args.index).as_number().unwrap_or(0.0).max(0.0) as i64;
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let n = match vm.host.cx_mut().script_data_fetch(QUAKES_FEED_URL) {
+                Some(bytes) => quake_num(&bytes, idx, field.trim()),
+                None => -9999.0,
+            };
+            ScriptValue::from_f64(n)
+        },
+    );
+
     // sys.places(lat, lon, "category", index, "field") -> a REAL nearby venue
     // from OpenStreetMap (Overpass API, keyless): row `index` (0 = nearest) of
     // the named places within 4 km, sorted by distance. THE LLM MUST CALL THIS
@@ -1617,6 +1893,8 @@ fn body_binds_live_data(body: &str) -> bool {
         || body.contains("sys.stock")
         || body.contains("sys.news")
         || body.contains("sys.movers")
+        // substring covers sys.quakesnum too (same trick as weather/weathernum)
+        || body.contains("sys.quakes")
         || body.contains("sys.places")
         // covers sys.search + sys.searchnum — the search-results card must
         // re-evaluate once the free-text search fetch lands
@@ -1627,6 +1905,11 @@ fn body_binds_live_data(body: &str) -> bool {
         // covers sys.navroute/navstep/navstepnum — the nav card's body must
         // re-evaluate ONCE when the OSRM fetch lands (fills nav_polyline)
         || body.contains("sys.nav")
+        // covers sys.citytimenum too — the clock card's body must re-evaluate
+        // once the tz-offset fetch lands (fn tick() then keeps it current)
+        || body.contains("sys.citytime")
+        // covers sys.fxnum too (sys.fmtnum does NOT match this prefix)
+        || body.contains("sys.fx")
 }
 
 /// Height (dp) of bar `index` of `count` for an intraday sparkline, from Yahoo's
@@ -1750,6 +2033,73 @@ fn stock_bar_height(bytes: &[u8], index: usize, count: usize, maxh: f64) -> f64 
 }
 
 /// Extract a scalar from an open-meteo JSON body at a dot-path, formatted for
+/// USGS live feed backing sys.quakes/sys.quakesnum: all M2.5+ earthquakes in
+/// the last 24 h as GeoJSON, newest first (keyless, ~50-200 KB).
+const QUAKES_FEED_URL: &str =
+    "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.geojson";
+
+/// Pluck one DISPLAY field for quake `idx` out of the raw USGS GeoJSON bytes.
+/// GeoJSON layout: features[i].properties.{mag,place,time(ms)} and
+/// features[i].geometry.coordinates = [lon, lat, depth_km].
+fn quake_field(bytes: &[u8], idx: i64, field: &str) -> String {
+    let f = field.to_ascii_lowercase();
+    let out = match f.as_str() {
+        "mag" | "magnitude" => json_pluck(bytes, &format!("features.{idx}.properties.mag"))
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|m| format!("{m:.1}")),
+        "depth" => json_pluck(bytes, &format!("features.{idx}.geometry.coordinates.2"))
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|d| format!("{d:.0} km")),
+        "lat" => json_pluck(bytes, &format!("features.{idx}.geometry.coordinates.1"))
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|v| format!("{v:.4}")),
+        "lon" => json_pluck(bytes, &format!("features.{idx}.geometry.coordinates.0"))
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|v| format!("{v:.4}")),
+        // Humanized age from the epoch-ms event time ("now", "12m ago", "3h ago").
+        "time" | "ago" => json_pluck(bytes, &format!("features.{idx}.properties.time"))
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|ms| {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as f64)
+                    .unwrap_or(ms);
+                let mins = ((now_ms - ms) / 60000.0).max(0.0) as i64;
+                if mins < 1 {
+                    "now".to_string()
+                } else if mins < 60 {
+                    format!("{mins}m ago")
+                } else if mins < 48 * 60 {
+                    format!("{}h ago", mins / 60)
+                } else {
+                    format!("{}d ago", mins / (60 * 24))
+                }
+            }),
+        "count" => json_pluck(bytes, "metadata.count"),
+        // Default (incl. "place"): the human-readable location string.
+        _ => json_pluck(bytes, &format!("features.{idx}.properties.place")),
+    };
+    out.unwrap_or_else(|| "—".to_string())
+}
+
+/// The numeric twin behind sys.quakesnum. -9999 while absent (sentinel shared
+/// with sys.weathernum so cards can guard with `>= -9998`).
+fn quake_num(bytes: &[u8], idx: i64, field: &str) -> f64 {
+    let f = field.to_ascii_lowercase();
+    let path = match f.as_str() {
+        "depth" => format!("features.{idx}.geometry.coordinates.2"),
+        "lat" => format!("features.{idx}.geometry.coordinates.1"),
+        "lon" => format!("features.{idx}.geometry.coordinates.0"),
+        "time" => format!("features.{idx}.properties.time"),
+        "count" => "metadata.count".to_string(),
+        // Default (incl. "mag").
+        _ => format!("features.{idx}.properties.mag"),
+    };
+    json_pluck(bytes, &path)
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(-9999.0)
+}
+
 /// display. A numeric path segment indexes into an array; other segments are
 /// object keys. Returns None if the path is absent or the leaf isn't a scalar.
 /// ISO datetimes ("2026-07-13T05:52", as open-meteo returns for sunrise/sunset)
@@ -1798,6 +2148,96 @@ fn weekday_from_days(z: i64) -> usize {
 /// Abbreviated weekday names, index 0 = Sunday.
 const DAY_EN: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const DAY_ZH: [&str; 7] = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+
+/// Abbreviated month names, index 0 = January (for sys.citytime "date").
+const MONTH_EN: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// The minimal open-meteo request that still carries `utc_offset_seconds` +
+/// `timezone` — sys.citytime's ONE cached fetch per place. Deliberately a
+/// DIFFERENT URL from sys.weather's so a pure clock card downloads ~300 bytes,
+/// not a 7-day forecast (they cache separately; a card using both fetches both).
+fn tz_offset_url(lat: f64, lon: f64) -> String {
+    format!(
+        "https://api.open-meteo.com/v1/forecast?latitude={lat:.4}&longitude={lon:.4}\
+&timezone=auto&forecast_days=1"
+    )
+}
+
+/// The DST-correct UTC offset (seconds) out of an open-meteo response.
+fn tz_offset_secs(bytes: &[u8]) -> Option<i64> {
+    json_pluck(bytes, "utc_offset_seconds")
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|v| v as i64)
+}
+
+/// Split place-local unix seconds into (hour 0-23, minute, second).
+fn hms_from_secs(local: i64) -> (i64, i64, i64) {
+    let sod = local.rem_euclid(86_400);
+    (sod / 3600, (sod / 60) % 60, sod % 60)
+}
+
+/// Render one sys.citytime field from place-local unix seconds + the offset.
+fn format_city_time(local: i64, off: i64, field: &str) -> String {
+    let (h, m, s) = hms_from_secs(local);
+    let days = local.div_euclid(86_400);
+    match field {
+        "hms" => format!("{h:02}:{m:02}:{s:02}"),
+        "h12" => {
+            let x = h % 12;
+            let h12 = if x == 0 { 12 } else { x };
+            let ap = if h < 12 { "AM" } else { "PM" };
+            format!("{h12}:{m:02} {ap}")
+        }
+        "day" => DAY_EN[weekday_from_days(days)].to_string(),
+        "day_zh" => DAY_ZH[weekday_from_days(days)].to_string(),
+        "date" => {
+            let (_y, mo, d) = civil_from_days(days);
+            format!("{} {}", MONTH_EN[(mo as usize).clamp(1, 12) - 1], d)
+        }
+        "date_zh" => {
+            let (_y, mo, d) = civil_from_days(days);
+            format!("{mo}月{d}日")
+        }
+        "offset" => {
+            let sign = if off < 0 { "-" } else { "+" };
+            let a = off.abs();
+            let (oh, om) = (a / 3600, (a / 60) % 60);
+            if om == 0 {
+                format!("UTC{sign}{oh}")
+            } else {
+                format!("UTC{sign}{oh}:{om:02}")
+            }
+        }
+        // "hm" and anything unrecognized: the clock's bread-and-butter form.
+        _ => format!("{h:02}:{m:02}"),
+    }
+}
+
+/// ONE cached FX fetch per currency PAIR — Yahoo's intraday FX chart, the
+/// same host + browser UA the stock helpers already use (proven on-device).
+/// NOTE: the Cloudflare-fronted keyless FX APIs (api.frankfurter.dev,
+/// open.er-api.com) both HANG from the Android TLS stack (no response, no
+/// error, no timeout) while working from desktop — do not switch back
+/// without on-device proof.
+fn fx_url(from: &str, to: &str) -> String {
+    format!("https://query1.finance.yahoo.com/v8/finance/chart/{from}{to}=X")
+}
+
+/// Where the live rate lives in Yahoo's chart response.
+const FX_RATE_PATH: &str = "chart.result.0.meta.regularMarketPrice";
+
+/// Display precision for an FX rate: 156.68, 7.253, 0.8669.
+fn format_fx_rate(r: f64) -> String {
+    if r >= 100.0 {
+        format!("{r:.2}")
+    } else if r >= 10.0 {
+        format!("{r:.3}")
+    } else {
+        format!("{r:.4}")
+    }
+}
 
 /// Reduce a 7-element `daily.*` temperature array to its min or max.
 ///
@@ -3015,8 +3455,19 @@ impl Splash {
             if let Some(scope) = scope_obj {
                 let tick_fn = vm.bx.heap.scope_value(scope, name, vm.trap());
                 if !tick_fn.is_nil() && !tick_fn.is_err() {
-                    vm.call(tick_fn, &[]);
+                    let ret = vm.call(tick_fn, &[]);
+                    if ret.is_err() {
+                        crate::log!("[SPLASH] call_fn({name:?}): fn returned err {ret:?}");
+                    }
+                } else {
+                    crate::log!(
+                        "[SPLASH] call_fn({name:?}): not found in body scope (nil={} err={})",
+                        tick_fn.is_nil(),
+                        tick_fn.is_err()
+                    );
                 }
+            } else {
+                crate::log!("[SPLASH] call_fn({name:?}): no body matches unique_id");
             }
         });
 

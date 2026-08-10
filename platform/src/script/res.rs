@@ -580,6 +580,7 @@ impl Cx {
         }
         let request_id = LiveId::unique();
         self.script_data.resources.begin_data_fetch(url, request_id);
+        crate::log!("Script data fetch: issuing {url}");
         let mut req = HttpRequest::new(url.to_string(), Default::default());
         // Host-appropriate UA — Yahoo 429s without a browser-ish one, Overpass
         // 406s ON the bare browser signature (see data_fetch_user_agent).

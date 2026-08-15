@@ -131,11 +131,35 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
     vm.add_method(
         sys,
         id_lut!(photo),
-        script_args_def!(query = NIL),
+        script_args_def!(query = NIL, cond = NIL),
         |vm, args| {
             let query_value = script_value!(vm, args.query);
             let mut query = String::new();
             vm.bx.heap.cast_to_string(query_value, &mut query);
+            // THE DAY, folded in. A card reading 92 % rain under a sunlit
+            // backdrop is the page disagreeing with its own tiles, and the card
+            // cannot fix that itself: the condition is a live fact, so it has to
+            // arrive here rather than be written into the prompt by the model.
+            //
+            // Appended, never substituted — the SCENE is the card's words and
+            // this only says what the sky is doing over them. A placeholder is
+            // dropped rather than described: "—" is not weather.
+            let cond_value = script_value!(vm, args.cond);
+            let mut cond = String::new();
+            vm.bx.heap.cast_to_string(cond_value, &mut cond);
+            let cond = cond.trim();
+            if !cond.is_empty()
+                && cond != "\u{2014}"
+                && cond != "n/a"
+                && !cond.starts_with("$[")
+                && !cond.eq_ignore_ascii_case("nil")
+            {
+                if !query.trim().is_empty() {
+                    query.push_str(", ");
+                }
+                query.push_str(&cond.to_lowercase());
+                query.push_str(" weather");
+            }
 
             // AI-generated, always ON-TOPIC 9:16 portrait image. loremflickr
             // OR-matches comma tags, so a multi-word subject ("paris eiffel
@@ -144,6 +168,20 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             // matches the subject and is high quality — the "nano banana"-style
             // AI source the app wants for beautiful full-screen backgrounds.
             let q = query.trim();
+            // A SUBJECT THAT HAS NOT ARRIVED IS NOT A SUBJECT. `sys.photo(query:
+            // place.name)` is resolved at draw time, and while the geocode is in
+            // flight the name is the placeholder — so the card asked flux to
+            // generate an image of "—", waited for it, and then asked again for
+            // the real place once the name landed. Two generations per card, and
+            // the first is a picture of nothing.
+            //
+            // No URL is the honest answer: the image is simply absent until the
+            // subject exists, and the next redraw asks once, for the place.
+            // Distinct from the EMPTY case below — an empty query is a card
+            // deliberately asking for any handsome backdrop, and it gets one.
+            if matches!(q, "—" | "n/a") || q.starts_with("$[") {
+                return vm.bx.heap.new_string_from_str("");
+            }
             let q = if q.is_empty() {
                 "beautiful cinematic landscape scenery, golden hour"
             } else {
@@ -414,6 +452,30 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
+    // sys.fetch(url) -> the raw response body, or "" while it loads. This is the
+    // ONLY Rust in the movie-detail path: a brokered HTTP primitive, nothing
+    // movie- or Wikipedia-specific. The URL-building and JSON parsing are done by
+    // the Splash data-source script that sys.wiki evaluates below.
+    vm.add_method(
+        sys,
+        id_lut!(fetch),
+        script_args_def!(url = NIL),
+        |vm, args| {
+            let url_v = script_value!(vm, args.url);
+            let mut url = String::new();
+            vm.bx.heap.cast_to_string(url_v, &mut url);
+            let url = url.trim();
+            if url.is_empty() {
+                return vm.bx.heap.new_string_from_str("");
+            }
+            let out = match vm.host.cx_mut().script_data_fetch(url) {
+                Some(bytes) => String::from_utf8_lossy(&bytes[..]).into_owned(),
+                None => String::new(),
+            };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
     // sys.geocodenum(name, "lat"|"lon") -> the coordinate as a NUMBER, -9999
     // while the lookup loads / when the place is unknown — the anchor for a map
     // card. Guard the whole card body on it:
@@ -473,6 +535,9 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let vias_v = script_value!(vm, args.vias);
             let mut vias = String::new();
             vm.bx.heap.cast_to_string(vias_v, &mut vias);
+            if !osrm_ready(lat1, lon1, lat2, lon2) {
+                return vm.bx.heap.new_string_from_str("—");
+            }
             let url = format!(
                 "https://router.project-osrm.org/route/v1/driving/{}?overview=false",
                 osrm_coords(lat1, lon1, lat2, lon2, &vias)
@@ -526,6 +591,9 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let vias_v = script_value!(vm, args.vias);
             let mut vias = String::new();
             vm.bx.heap.cast_to_string(vias_v, &mut vias);
+            if !osrm_ready(lat1, lon1, lat2, lon2) {
+                return vm.bx.heap.new_string_from_str("—");
+            }
             let url = navroute_url(lat1, lon1, lat2, lon2, &vias);
             let out = match nav_route_cached(vm, &url) {
                 Some(route) => match field.trim() {
@@ -577,6 +645,9 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let vias_v = script_value!(vm, args.vias);
             let mut vias = String::new();
             vm.bx.heap.cast_to_string(vias_v, &mut vias);
+            if !osrm_ready(lat1, lon1, lat2, lon2) {
+                return vm.bx.heap.new_string_from_str("—");
+            }
             let url = navroute_url(lat1, lon1, lat2, lon2, &vias);
             let out = match nav_route_cached(vm, &url) {
                 Some(route) => nav_step_field(&route, d, field.trim()),
@@ -619,6 +690,9 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let vias_v = script_value!(vm, args.vias);
             let mut vias = String::new();
             vm.bx.heap.cast_to_string(vias_v, &mut vias);
+            if !osrm_ready(lat1, lon1, lat2, lon2) {
+                return vm.bx.heap.new_string_from_str("—");
+            }
             let url = navroute_url(lat1, lon1, lat2, lon2, &vias);
             let n = match nav_route_cached(vm, &url) {
                 Some(route) => nav_progress_m(&route, at_lat, at_lon),
@@ -655,6 +729,9 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let vias_v = script_value!(vm, args.vias);
             let mut vias = String::new();
             vm.bx.heap.cast_to_string(vias_v, &mut vias);
+            if !osrm_ready(lat1, lon1, lat2, lon2) {
+                return vm.bx.heap.new_string_from_str("—");
+            }
             let url = navroute_url(lat1, lon1, lat2, lon2, &vias);
             let n = match nav_route_cached(vm, &url) {
                 Some(route) => nav_step_num(&route, d, field.trim()),
@@ -2184,6 +2261,11 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let field_v = script_value!(vm, args.field);
             let mut field = String::new();
             vm.bx.heap.cast_to_string(field_v, &mut field);
+            // An empty query is not a search — photon answers it 400, and the
+            // one thing that can come back is a terminal failure for nothing.
+            if query.trim().is_empty() {
+                return vm.bx.heap.new_string_from_str("");
+            }
             let url = search_url(query.trim());
             let out = match vm.host.cx_mut().script_data_fetch(&url) {
                 None => String::new(),
@@ -2211,6 +2293,9 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let field_v = script_value!(vm, args.field);
             let mut field = String::new();
             vm.bx.heap.cast_to_string(field_v, &mut field);
+            if query.trim().is_empty() {
+                return ScriptValue::from_f64(-9999.0);
+            }
             let url = search_url(query.trim());
             let n = match vm.host.cx_mut().script_data_fetch(&url) {
                 None => -9999.0,
@@ -2253,6 +2338,9 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let vias_v = script_value!(vm, args.vias);
             let mut vias = String::new();
             vm.bx.heap.cast_to_string(vias_v, &mut vias);
+            if !osrm_ready(lat1, lon1, lat2, lon2) {
+                return vm.bx.heap.new_string_from_str("—");
+            }
             let url = navroute_url(lat1, lon1, lat2, lon2, &vias);
             let n = match nav_route_cached(vm, &url) {
                 Some(route) => match field.trim() {
@@ -3515,6 +3603,17 @@ fn osrm_coords(lat1: f64, lon1: f64, lat2: f64, lon2: f64, vias: &str) -> String
 /// One URL per (from, vias…, to) so sys.navroute, sys.navstep and the MapView
 /// widget all share a single deduped OSRM fetch. The via list keys into the
 /// cache for free (the full URL is the key).
+/// Whether a trip's endpoints are REAL yet. `sys.searchnum` answers -9999
+/// while its geocode is in flight (and forever for an empty query), and that
+/// sentinel was going out on the wire as a coordinate: measured,
+/// `route/v1/driving/-9999.00000,-9999.00000;…` → 400 — which is TERMINAL, so
+/// every such call also burned a permanent failure for nothing. A route whose
+/// endpoint is not a place yet is not a route to fetch; it is a route to wait
+/// for, and "—" already means exactly that.
+fn osrm_ready(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> bool {
+    [lat1, lon1, lat2, lon2].iter().all(|v| *v > -9998.0)
+}
+
 fn navroute_url(lat1: f64, lon1: f64, lat2: f64, lon2: f64, vias: &str) -> String {
     format!(
         "https://router.project-osrm.org/route/v1/driving/{}?overview=full&steps=true",

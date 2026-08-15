@@ -234,11 +234,13 @@ impl Cx {
                                     .resources
                                     .handle_data_fetch_response(request_id, body.clone());
                             } else {
-                                crate::log!("Script data fetch: {status} with empty body; retrying");
+                                let url = self.script_data.resources.data_fetch_url(request_id).unwrap_or_default();
+                                crate::log!("Script data fetch: {status} with empty body; retrying url={url}");
                                 self.retry_data_fetch_or_fail(request_id);
                             }
                         } else {
-                            crate::log!("Script data fetch failed: status={status}");
+                            let url = self.script_data.resources.data_fetch_url(request_id).unwrap_or_default();
+                            crate::log!("Script data fetch failed: status={status} url={url}");
                             // Transient statuses are worth retrying; a permanent
                             // 4xx (404/403) fails identically every time -> make
                             // it terminal at once.

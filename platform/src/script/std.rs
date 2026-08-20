@@ -230,6 +230,10 @@ impl Cx {
                         let body = res.get_body().filter(|b| !b.is_empty());
                         if (200..300).contains(&status) {
                             if let Some(body) = body {
+                                crate::log!(
+                                    "Script data fetch: loaded {} bytes (status {status})",
+                                    body.len()
+                                );
                                 self.script_data
                                     .resources
                                     .handle_data_fetch_response(request_id, body.clone());

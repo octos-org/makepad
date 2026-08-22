@@ -18,6 +18,11 @@ script_mod! {
         show_bg: true
         draw_bg +: {
             cond: uniform(0.0)
+            // Mood-owned MONO ink: when it carries alpha, the finished glyph is
+            // recoloured to a single-ink silhouette — the line-art restraint a
+            // photo-mood card asks for instead of the filled multi-colour icon.
+            // Alpha 0 (default) keeps the legacy colours.
+            mono_ink: uniform(vec4(0.0))
 
             pixel: fn() {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
@@ -135,7 +140,11 @@ script_mod! {
                     sdf.box(cx - w*0.22 + sin(t*0.9+1.2)*w*0.05, b+h*0.13, w*0.44, 6.0, 3.0) sdf.fill(#xc6d2e2)
                     sdf.box(cx - w*0.26 + sin(t*0.9+2.3)*w*0.05, b+h*0.26, w*0.48, 6.0, 3.0) sdf.fill(#xd0dcec)
                 }
-                return sdf.result
+                let mono = step(0.001, self.mono_ink.w)
+                // Premultiplied, like everything Sdf2d returns: an
+                // unpremultiplied ink here painted the whole quad solid.
+                let ma = sdf.result.w * self.mono_ink.w
+                return mix(sdf.result, vec4(self.mono_ink.xyz * ma, ma), mono)
             }
         }
     }
